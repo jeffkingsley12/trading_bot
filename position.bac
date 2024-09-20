@@ -1,0 +1,848 @@
+import asyncio
+from typing import Dict, Any, Optional, List, Tuple
+from decimal import Decimal
+from binance.error import ClientError
+from logs import logger
+from utils import round_decimal
+from asyncio import Semaphore
+import time as time_module
+import backoff
+from config import CONFIG
+from orders import place_order, get_orders, check_balance, cancel_open_orders
+from rate_limiters import RateLimiter
+from enums import (
+    Order,
+    OrderState,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+    OrderEntry,
+    Position,
+    ExitAttempt,
+)
+
+from rate_limiters import InsufficientBalance
+
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque
+
+exit_attempt = ExitAttempt()
+
+
+class OrderQueue:
+    def __init__(self):
+        self.queue: Deque[OrderEntry] = deque()
+
+    def add(self, order_id: int, quantity: Decimal, price: Decimal):
+        self.queue.append(OrderEntry(order_id, quantity, price))
+
+    def remove(self, quantity: Decimal) -> List[Tuple[int, Decimal, Decimal]]:
+        removed = []
+        remaining = quantity
+        while remaining > 0 and self.queue:
+            entry = self.queue[0]
+            if entry.quantity <= remaining:
+                removed.append((entry.order_id, entry.quantity, entry.price))
+                remaining -= entry.quantity
+                self.queue.popleft()
+            else:
+                removed.append((entry.order_id, remaining, entry.price))
+                self.queue[0] = OrderEntry(
+                    entry.order_id, entry.quantity - remaining, entry.price
+                )
+                remaining = Decimal("0")
+        return removed
+
+    def __len__(self):
+        return len(self.queue)
+
+    def total_quantity(self) -> Decimal:
+        return sum(entry.quantity for entry in self.queue)
+
+    def total_price(self) -> Decimal:
+        return sum(entry.quantity * entry.price for entry in self.queue)
+
+
+class TradingStrategy:
+    @staticmethod
+    def is_stop_loss_triggered(
+        side: OrderSide,
+        current_price: Decimal,
+        entry_price: Decimal,
+        stop_loss: Decimal,
+    ) -> bool:
+        if side == OrderSide.BUY:
+            logger.info("******THIS STOP LOSS QUICK******")
+            return current_price <= entry_price * (1 - stop_loss)
+        else:
+            return current_price >= entry_price * (1 + stop_loss)
+
+    @staticmethod
+    def is_profit_target_reached(
+        side: OrderSide,
+        current_price: Decimal,
+        entry_price: Decimal,
+        profit_target: Decimal,
+    ) -> bool:
+        if side == OrderSide.BUY:
+            logger.info("💰💰💰THIS PROFITS QUICK ON BUY SIDE💰💰💰")
+            return current_price >= entry_price * (1 + profit_target)
+        else:
+            logger.info("💰💰💰THIS PROFITS QUICK ON SELL SIDE💰💰💰")
+            return current_price <= entry_price * (1 - profit_target)
+
+    @staticmethod
+    def is_reversal_pattern_valid(
+        side: OrderSide, bullish_engulfing: bool, bearish_engulfing: bool
+    ) -> bool:
+        logger.info("THIS REVERSAL QUICK")
+        return (side == OrderSide.BUY and bearish_engulfing) or (
+            side == OrderSide.SELL and bullish_engulfing
+        )
+
+
+class PositionTracker:
+    def __init__(
+        self,
+        client: Any,
+        symbol_info,
+        current_price: Decimal,
+        rate_limiter: RateLimiter,
+        strategy: TradingStrategy,
+    ):
+        self.client = client
+        self.cancel_open_orders = cancel_open_orders
+        self.orders: Dict[int, Order] = {}
+        self.positions: Dict[str, Position] = {}
+        self.symbol_info = symbol_info
+        self.current_price = current_price
+        self.buy_queue: Dict[str, OrderQueue] = {}
+        self.sell_queue: Dict[str, OrderQueue] = {}
+        # self.update_orders(orders)
+        self.monitoring_tasks: Dict[int, asyncio.Task] = {}
+        self.lock = asyncio.Lock()
+        self.rate_limiter = rate_limiter
+        self.strategy = strategy
+        self.order_semaphore = Semaphore(10)  # Limit to 10 concurrent order processing
+        self.check_balance = check_balance
+
+    async def initialize(self, orders: Tuple[List[dict], List[dict]]) -> List[dict]: 
+        """
+        Initializes the PositionTracker with existing orders and synchronizes with the exchange.
+
+        Args:
+            orders: A list containing two elements:
+                - orders[0]: A list of dictionaries representing historical (filled/canceled) orders.
+                - orders[1]: A list of dictionaries representing currently open orders.
+        """
+        historical_orders, open_orders = orders
+
+        # Process historical (filled or canceled) orders
+        for order_data in historical_orders:
+            await self.update_order(order_data)
+
+        # Instead of processing open orders directly, we'll use sync_with_exchange
+        await self.sync_with_exchange(open_orders)
+
+    async def enter_position(
+        self, symbol, quantity, price, entry_type, stop_loss, take_profit
+    ):
+        side = OrderSide.BUY if entry_type == "long" else OrderSide.SELL
+        quote_asset = symbol[-5:]  # Assumes 4-letter quote asset like USDT
+
+        required_balance = quantity * price if side == OrderSide.BUY else quantity
+
+        if not await self.check_balance(
+            self.client,
+            quote_asset if side == OrderSide.BUY else symbol[:-4],
+            required_balance,
+        ):
+            logger.warning(
+                f"Insufficient balance for {entry_type} position on {symbol}"
+            )
+            return None
+
+        # Place the main entry order
+        order_response = await place_order(
+            self.client,
+            symbol_info=self.symbol_info,
+            is_buy=(side == OrderSide.BUY),
+            quantity=quantity,
+            price=price,
+            minimum_lot_size=CONFIG["minimum_lot_size"],
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            stop_price=None,
+        )
+
+        if order_response:
+            await self.update_position(symbol, order_response)
+
+            # Calculate stop loss and take profit prices
+            stop_loss_price = (
+                price * (1 - stop_loss)
+                if side == OrderSide.BUY
+                else price * (1 + stop_loss)
+            )
+            take_profit_price = (
+                price * (1 + take_profit)
+                if side == OrderSide.BUY
+                else price * (1 - take_profit)
+            )
+
+            # Place stop loss order
+            stop_loss_order = await place_order(
+                self.client,
+                symbol_info=self.symbol_info,
+                is_buy=(side != OrderSide.BUY),  # Opposite of entry order
+                quantity=quantity,
+                price=float(stop_loss_price),
+                minimum_lot_size=CONFIG["minimum_lot_size"],
+                order_type=OrderType.STOP_LOSS_LIMIT,
+                time_in_force=TimeInForce.GTC,
+                stop_price=stop_loss_price,
+            )
+
+            if stop_loss_order:
+                logger.info(
+                    f"Stop loss order placed for {entry_type} entry: {stop_loss_order}"
+                )
+            else:
+                logger.error(f"Failed to place stop loss order for {entry_type} entry")
+
+            # Place take profit order
+            take_profit_order = await place_order(
+                self.client,
+                symbol_info=self.symbol_info,
+                is_buy=(side != OrderSide.BUY),  # Opposite of entry order
+                quantity=quantity,
+                price=float(take_profit_price),
+                minimum_lot_size=CONFIG["minimum_lot_size"],
+                order_type=OrderType.TAKE_PROFIT_LIMIT,
+                time_in_force=TimeInForce.GTC,
+                stop_price=take_profit_price,
+            )
+
+            if take_profit_order:
+                logger.info(
+                    f"Take profit order placed for {entry_type} entry: {take_profit_order}"
+                )
+            else:
+                logger.error(
+                    f"Failed to place take profit order for {entry_type} entry"
+                )
+
+            return order_response, stop_loss_order, take_profit_order
+        else:
+            logger.error(f"Failed to enter {entry_type} position for {symbol}")
+            return None
+
+    async def exit_position(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        price: Decimal,
+        exit_type: str,
+        current_price: Decimal,
+        max_slippage: Decimal = Decimal("0.001"),
+    ):
+        try:
+            if not exit_attempt.can_attempt():
+                logger.info(
+                    f"Cooldown period active for {exit_type} {symbol}. Skipping exit attempt."
+                )
+                return
+
+            logger.info(f"Attempting to {exit_type} position for {symbol}")
+
+            async with self.lock:
+                position = self.positions.get(symbol)
+                if (
+                    not position
+                    or not position.is_open
+                    or position.side != OrderSide.BUY
+                ):
+                    logger.warning(f"No open LONG position found for {symbol}")
+                    return
+
+                actual_quantity = position.net_quantity
+                entry_price = position.average_price
+
+                if actual_quantity == 0:
+                    logger.warning(
+                        f"Position quantity for {exit_type} {symbol} is zero. Skipping exit."
+                    )
+                    return
+
+                pnl = (current_price - entry_price) * actual_quantity
+                pnl_percentage = (
+                    (pnl / (entry_price * actual_quantity)) * 100
+                    if entry_price > 0 and actual_quantity > 0
+                    else Decimal("0")
+                )
+
+                logger.info(
+                    f"Potential P/L for {exit_type}: {pnl} ({pnl_percentage:.2f}%)"
+                )
+
+                if current_price < price * (1 - max_slippage):
+                    logger.warning(
+                        f"Current market price ({current_price}) exceeds maximum slippage. Aborting exit."
+                    )
+                    return
+
+                try:
+                    close_response = await self.close_position(
+                        symbol, actual_quantity, price
+                    )
+                    if close_response:
+                        logger.info(f"Closed {exit_type} position: {close_response}")
+                        actual_exit_price = Decimal(close_response.price)
+                        actual_pnl = (actual_exit_price - entry_price) * actual_quantity
+                        actual_pnl_percentage = (
+                            (actual_pnl / (entry_price * actual_quantity)) * 100
+                            if entry_price > 0 and actual_quantity > 0
+                            else Decimal("0")
+                        )
+                        logger.info(
+                            f"Actual P/L for {exit_type}: {actual_pnl} ({actual_pnl_percentage:.2f}%)"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to close {exit_type} position for {symbol}"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Error while closing {exit_type} position for {symbol}: {str(e)}"
+                    )
+                    return
+
+                # Use the new timeout-protected method
+                cancelled_orders = await self.cancel_open_orders(symbol)
+                logger.info(
+                    f"Cancelled {len(cancelled_orders)} open orders for {symbol}"
+                )
+
+        except asyncio.CancelledError:
+            logger.warning(f"Exit position operation for {symbol} was cancelled")
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in exit_position for {symbol}: {str(e)}",
+                exc_info=True,
+            )
+
+    async def update_orders(self, orders: List[Dict[str, Any]]):
+        for order_data in orders:
+            await self.update_order(order_data)
+
+    async def update_order(self, order_data: Dict[str, Any]):
+        try:
+            start_time = time_module.time()
+            order_obj = Order.from_dict(order_data)
+            order_id = order_obj.order_id
+            symbol = order_obj.symbol
+
+            async with self.order_semaphore:
+                if order_id not in self.orders:
+                    self.orders[order_id] = order_obj
+                    logger.info(f"Added new order: {order_obj}")
+                else:
+                    existing_order = self.orders[order_id]
+                    if existing_order.status != order_obj.status:
+                        self.orders[order_id] = order_obj
+                        logger.info(
+                            f"Updated order {order_id}: Status changed from {existing_order.status} to {order_obj.status}"
+                        )
+
+                await self.update_position(symbol, order_obj)
+                logger.info(
+                    f"Updated position for {symbol}: {self.positions.get(symbol)}"
+                )
+
+        except Exception as e:
+            logger.error(f"Error updating order: {e}", exc_info=True)
+            logger.error(f"Problematic order data: {order_data}")
+
+        finally:
+            elapsed_time = time_module.time() - start_time
+            logger.info(f"Order processing took {elapsed_time:.2f} seconds")
+
+    async def get_open_positions(self, symbol: str) -> List[Position]:
+        async with self.lock:
+            position = self.positions.get(symbol)
+            open_orders = [
+                order
+                for order in self.orders.values()
+                if order.symbol == symbol and order.status == OrderStatus.NEW
+            ]
+
+            if position and position.net_quantity != 0:
+                logger.debug(f"Open position for {symbol}: {position}")
+                return [position]
+            elif open_orders:
+                total_quantity = sum(Decimal(order.quantity) for order in open_orders)
+                average_price = (
+                    sum(
+                        Decimal(order.price) * Decimal(order.quantity)
+                        for order in open_orders
+                    )
+                    / total_quantity
+                )
+                open_position = Position(
+                    symbol, total_quantity, average_price, open_orders[0].side
+                )
+                logger.debug(
+                    f"Open position (from open orders) for {symbol}: {open_position}"
+                )
+                return [open_position]
+            else:
+                logger.debug(f"No open position for {symbol}")
+                return []
+
+    async def get_open_orders(self, orders: str) -> List[Dict[str, Any]]:
+        try:
+            await self.rate_limiter.wait()
+            open_orders = await orders[1]
+            return open_orders
+        except Exception as e:
+            logger.error(f"Error fetching open orders for {open_orders}: {str(e)}")
+            return []
+
+    async def sync_with_exchange(
+        self, initial_open_orders: List[Dict[str, Any]] = None
+    ):
+        try:
+            # If initial_open_orders is provided, use it. Otherwise, fetch from exchange.
+            if initial_open_orders is None:
+                logger.info("Fetching initial open orders from exchange")
+                exchange_orders = await get_orders(orders)
+            else:
+                exchange_orders = initial_open_orders
+
+            # Update local order tracking
+            for order_data in exchange_orders:
+                await self.update_order(order_data)
+
+            # Remove any local orders not present on exchange
+            local_order_ids = set(self.orders.keys())
+            exchange_order_ids = set(int(order["orderId"]) for order in exchange_orders)
+            for order_id in local_order_ids - exchange_order_ids:
+                del self.orders[order_id]
+
+            # Fetch and update positions
+            try:
+                logger.info("Attempting to fetch balance")
+                exchange_positions = self.client.account()
+                for balance in exchange_positions["balances"]:
+                    symbol = balance["asset"]
+                    free = Decimal(balance["free"])
+                    locked = Decimal(balance["locked"])
+                    total = free + locked
+                    if total > 0:
+                        # Determine the side based on the locked amount
+                        side = "BUY" if locked > 0 else None
+                        self.positions[symbol] = Position(
+                            symbol,
+                            total,
+                            Decimal("0"),
+                            side,
+                            net_quantity=total,
+                            average_price=0,
+                        )
+            except Exception as e:
+                logger.error(f"Error fetching account information: {str(e)}")
+
+            logger.info("Synchronized orders and positions with exchange")
+
+        except Exception as e:
+            logger.error(f"Error syncing with exchange: {e}", exc_info=True)
+
+    # Call this method periodically, e.g., every 5 minutes
+    # asyncio.create_task(self.sync_with_exchange())
+
+    async def update_position(self, symbol: str, order: Order):
+        async with self.lock:
+            if symbol not in self.buy_queue:
+                self.buy_queue[symbol] = OrderQueue()
+                self.sell_queue[symbol] = OrderQueue()
+
+            executed_quantity = order.executed_quantity
+            remaining_quantity = order.quantity - executed_quantity
+
+            queue = (
+                self.buy_queue[symbol]
+                if order.side == OrderSide.BUY
+                else self.sell_queue[symbol]
+            )
+
+            if order.status == OrderStatus.FILLED:
+                queue.add(order.order_id, executed_quantity, order.price)
+            elif order.status == OrderStatus.PARTIALLY_FILLED:
+                queue.add(order.order_id, executed_quantity, order.price)
+            elif order.status == OrderStatus.CANCELED:
+                queue.remove(remaining_quantity)
+
+            buy_quantity = self.buy_queue[symbol].total_quantity()
+            sell_quantity = self.sell_queue[symbol].total_quantity()
+            net_quantity = (
+                buy_quantity
+                - sell_quantity
+                + (
+                    executed_quantity
+                    if order.side == OrderSide.BUY
+                    else -executed_quantity
+                )
+            )
+
+            if symbol not in self.positions:
+                self.positions[symbol] = Position(
+                    symbol, Decimal("0"), Decimal("0"), order.side
+                )
+
+            position = self.positions[symbol]
+            old_quantity = position.quantity
+
+            if order.side == OrderSide.BUY:
+                position.net_quantity += executed_quantity
+            else:
+                position.net_quantity -= executed_quantity
+
+            position.quantity = abs(position.net_quantity)
+
+            if position.quantity != Decimal("0"):
+                position.average_price = (
+                    (position.average_price * old_quantity)
+                    + (order.price * executed_quantity)
+                ) / position.quantity
+            else:
+                position.average_price = Decimal("0")
+
+            position.side = (
+                OrderSide.BUY if position.net_quantity > 0 else OrderSide.SELL
+            )
+
+            logger.info(f"Updated position for {symbol}: {position}")
+
+    async def close_position(
+        self, symbol: str, quantity: Decimal, price: Decimal
+    ) -> Optional[Order]:
+        try:
+            position = self.positions.get(symbol)
+            if not position or not position.is_open:
+                logger.warning(f"No open position found for {symbol}. Skipping close.")
+                return None
+
+            close_quantity = min(abs(position.net_quantity), abs(quantity))
+            if close_quantity == 0:
+                logger.warning(
+                    f"Position quantity for {symbol} is zero. Skipping close."
+                )
+                return None
+
+            close_side = OrderSide.SELL if position.net_quantity > 0 else OrderSide.BUY
+            quantity = round_decimal(close_quantity, CONFIG["decimal_places"])
+            price = round_decimal(price, CONFIG["decimal_places"])
+
+            logger.info(
+                f"Attempting to close position: symbol={symbol}, side={close_side}, quantity={quantity}, price={price}"
+            )
+
+            response = await place_order(
+                self.client,
+                self.symbol_info,
+                is_buy=(close_side == OrderSide.BUY),
+                quantity=quantity,
+                price=price,
+                minimum_lot_size=CONFIG["minimum_lot_size"],
+                order_type=OrderType.TAKE_PROFIT_LIMIT,
+                time_in_force=TimeInForce.GTC,
+                stop_price=price,
+            )
+
+            if response:
+                order = (
+                    Order.from_dict(response)
+                    if isinstance(response, dict)
+                    else response
+                )
+                await self.update_position(symbol, order)
+                self.orders[order.order_id] = order
+                await self.start_monitoring(symbol, order.order_id)
+                logger.info(f"Position closed successfully: {order}")
+                return order
+            else:
+                logger.error(f"Failed to close position: {symbol}, {quantity}, {price}")
+                return None
+
+        except InsufficientBalance as error:
+            logger.error(
+                f"Close position failed for {symbol} due to insufficient balance: {str(error)}"
+            )
+            return None
+        except Exception as error:
+            logger.error(
+                f"Close position error for {symbol}: {str(error)}", exc_info=True
+            )
+            return None
+
+    async def start_monitoring(self, symbol: str, order_id: int):
+        if order_id not in self.monitoring_tasks:
+            task = asyncio.create_task(self.monitor_order_status(symbol, order_id))
+            self.monitoring_tasks[order_id] = task
+
+    async def monitor_order_status(self, symbol: str, order_id: int):
+        while True:
+            try:
+                await self.rate_limiter.wait()
+                order = self.orders.get(order_id)
+                if order is None or order.symbol != symbol:
+                    logger.warning(f"Order {order_id} for {symbol} not found")
+                    break
+
+                if order.status in (OrderStatus.FILLED, OrderStatus.CANCELED):
+                    logger.info(
+                        f"Order {order_id} {order.status.value.lower()} for {symbol}."
+                    )
+                    async with self.lock:
+                        if order.status == OrderStatus.FILLED:
+                            await self.update_position(symbol, order)
+                            logger.info(
+                                f"Updated position in monitor order status {self.positions[symbol]}"
+                            )
+                        else:
+                            await self.remove_position(symbol, order_id)
+                            logger.info(
+                                f"Removed position in monitor order status {self.positions[symbol]}"
+                            )
+                    break
+
+                if order.status == OrderStatus.NEW:
+                    updated_order = await self.get_order_from_exchange(symbol, order_id)
+                    if updated_order:
+                        async with self.lock:
+                            self.orders[order_id] = updated_order
+                        logger.info(
+                            f"Updated order {order_id} {updated_order.status.value.lower()} for {symbol}."
+                        )
+            except Exception as error:
+                logger.error(
+                    f"Error monitoring order {order_id} for {symbol}: {str(error)}"
+                )
+
+            await asyncio.sleep(6)
+
+        self.monitoring_tasks.pop(order_id, None)
+
+    async def get_position_value(self, symbol: str) -> Decimal:
+        async with self.lock:
+            position = self.positions.get(symbol)
+            if position:
+                return round_decimal(
+                    position.net_quantity * position.average_price,
+                    CONFIG["decimal_places"],
+                )
+            return Decimal("0")
+
+    async def close_all_positions(self, symbol: str) -> List[Order]:
+        open_positions = await self.get_open_positions(symbol)
+        close_tasks = [
+            self.close_position(symbol, position.net_quantity, position.average_price)
+            for position in open_positions
+        ]
+        closed_orders = await asyncio.gather(*close_tasks, return_exceptions=True)
+        successfully_closed = [
+            order for order in closed_orders if isinstance(order, Order)
+        ]
+        logger.info(
+            f"Closed {len(successfully_closed)} out of {len(open_positions)} positions for {symbol}"
+        )
+        return successfully_closed
+
+    async def emergency_closure(self, symbol: str) -> Tuple[List[Order], List[Order]]:
+        logger.warning(f"Initiating emergency closure for {symbol}")
+        try:
+            cancel_task = asyncio.create_task(
+                self.cancel_open_orders(self.client, symbol)
+            )
+            close_task = asyncio.create_task(self.close_all_positions(symbol))
+
+            cancelled_orders, closed_positions = await asyncio.gather(
+                cancel_task, close_task
+            )
+
+            logger.info(
+                f"Emergency closure completed for {symbol}. "
+                f"Cancelled orders: {len(cancelled_orders)}, Closed positions: {len(closed_positions)}"
+            )
+            return cancelled_orders, closed_positions
+        except Exception as error:
+            logger.error(f"Error during emergency closure for {symbol}: {str(error)}")
+            return [], []
+
+    async def monitor_positions(
+        self,
+        symbol: str,
+        current_price: Decimal,
+        sell_price: Decimal,
+        buy_price: Decimal,
+        stop_loss: Decimal,
+        profit_target: Decimal,
+        reversal_pattern: bool,
+        bullish_engulfing: bool,
+        bearish_engulfing: bool,
+    ) -> List[Order]:
+        open_positions = await self.get_open_positions(symbol)
+        results = []
+
+        for position in open_positions:
+            result = await self.check_position_conditions(
+                symbol,
+                position,
+                current_price,
+                sell_price,
+                buy_price,
+                stop_loss,
+                profit_target,
+                reversal_pattern,
+                bullish_engulfing,
+                bearish_engulfing,
+            )
+            if result:
+                results.append(result)
+
+        return results
+
+    async def check_position_conditions(
+        self,
+        symbol: str,
+        position: Position,
+        current_price: Decimal,
+        sell_price: Decimal,
+        buy_price: Decimal,
+        stop_loss: Decimal,
+        profit_target: Decimal,
+        reversal_pattern: bool,
+        bullish_engulfing: bool,
+        bearish_engulfing: bool,
+    ) -> Optional[Order]:
+        if position.net_quantity == Decimal("0"):
+            logger.warning(f"No open position for {symbol}. Skipping position check.")
+            return None
+
+        entry_price = position.average_price
+        position_quantity = abs(position.net_quantity)
+
+        # Calculate current profit/loss percentage
+        if entry_price > 0:
+            pnl_percentage = (
+                ((current_price - entry_price) / entry_price) * 100
+                if position.side == OrderSide.BUY
+                else ((entry_price - current_price) / entry_price) * 100
+            )
+        else:
+            pnl_percentage = Decimal("0")
+
+        logger.info(f"Current P/L for {symbol}: {pnl_percentage:.2f}%")
+
+        # Define thresholds
+        quick_profit_threshold = Decimal("0.009")  # 0.9%
+        significant_profit_threshold = Decimal("0.015")  # 1.5%
+        loss_threshold = Decimal("-0.03")  # -1%
+
+        # Check for stop loss
+        if self.strategy.is_stop_loss_triggered(
+            position.side, current_price, entry_price, stop_loss
+        ):
+            return await self.close_position_with_logging(
+                symbol, position_quantity, current_price, "Stop loss"
+            )
+
+        # Check for profit target
+        if self.strategy.is_profit_target_reached(
+            position.side, current_price, entry_price, profit_target
+        ):
+            return await self.close_position_with_logging(
+                symbol, position_quantity, current_price, "Profit target"
+            )
+
+        if position.side == OrderSide.BUY:
+            if pnl_percentage >= significant_profit_threshold:
+                # Take full profit if we've reached a significant gain
+                return await self.close_position_with_logging(
+                    symbol, position_quantity, current_price, "Significant profit"
+                )
+            elif pnl_percentage >= quick_profit_threshold:
+                # Take partial profit on quick gains
+                partial_quantity = position_quantity * Decimal("0.5")
+                return await self.close_position_with_logging(
+                    symbol, partial_quantity, current_price, "Partial quick profit"
+                )
+            elif pnl_percentage <= loss_threshold and current_price < entry_price:
+                # Minimize losses if price drops below threshold
+                return await self.close_position_with_logging(
+                    symbol, position_quantity, current_price, "Minimize loss"
+                )
+        elif position.side == OrderSide.SELL:
+            if pnl_percentage >= significant_profit_threshold:
+                # Take full profit if we've reached a significant gain (for short positions)
+                return await self.close_position_with_logging(
+                    symbol,
+                    position_quantity,
+                    current_price,
+                    "Significant profit (short)",
+                )
+            elif pnl_percentage >= quick_profit_threshold:
+                # Take partial profit on quick gains (for short positions)
+                partial_quantity = position_quantity * Decimal("0.5")
+                return await self.close_position_with_logging(
+                    symbol,
+                    partial_quantity,
+                    current_price,
+                    "Partial quick profit (short)",
+                )
+            elif pnl_percentage <= loss_threshold and current_price > entry_price:
+                # Minimize losses if price rises above threshold (for short positions)
+                return await self.close_position_with_logging(
+                    symbol, position_quantity, current_price, "Minimize loss (short)"
+                )
+
+        # Check for reversal patterns
+        if reversal_pattern and self.strategy.is_reversal_pattern_valid(
+            position.side, bullish_engulfing, bearish_engulfing
+        ):
+            return await self.close_position_with_logging(
+                symbol, position_quantity, current_price, "Reversal pattern"
+            )
+
+        return None
+
+    async def close_position_with_logging(
+        self, symbol: str, quantity: Decimal, price: Decimal, reason: str
+    ) -> Optional[Order]:
+        logger.info(
+            f"Attempting to close position due to {reason}: {symbol}, {quantity}, {price}"
+        )
+        close_response = await self.close_position(symbol, quantity, price)
+        if close_response:
+            logger.info(f"{reason} triggered. Closed position: {close_response}")
+            return close_response
+        else:
+            logger.error(
+                f"Failed to close position on {reason.lower()}: {symbol}, {quantity}, {price}"
+            )
+            return None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.cancel_all_monitoring_tasks()
+
+    async def cancel_all_monitoring_tasks(self):
+        tasks = list(self.monitoring_tasks.values())
+        self.monitoring_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

@@ -1,0 +1,423 @@
+import pandas as pd
+import numpy as np
+from typing import Optional
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from ta.volatility import AverageTrueRange, BollingerBands
+from concurrent.futures import ProcessPoolExecutor
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, SMAIndicator
+from logs import logger
+from decimal import Decimal
+from config import CONFIG
+from concurrent.futures import ThreadPoolExecutor
+from utils import round_decimal
+from utils import apply_total_signal, adjust_number
+
+import joblib
+import asyncio
+
+import os
+
+precision = CONFIG["precision"]
+
+
+async def train_and_save_ml_model(
+    df: pd.DataFrame,
+    model_path: str = "rf_model.joblib",
+    scaler_path: str = "scaler.joblib",
+):
+    features = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "atr",
+        "rsi",
+        "SMA",
+        "MACD",
+        "MACD_Signal",
+        "SMA_50",
+        "SMA_200",
+        "bbm",
+        "bbh",
+        "bbl",
+        "bb_width",
+    ]
+    X = df[features].values
+    y = df["close"].shift(-1).values
+
+    X = X[:-1]
+    y = y[:-1]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor() as pool:
+        model = await loop.run_in_executor(pool, train_model, X_train_scaled, y_train)
+
+    y_pred = model.predict(X_test_scaled)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    logger.info(f"Model performance - MSE: {mse:.4f}, R2: {r2:.4f}")
+
+    await asyncio.gather(
+        loop.run_in_executor(None, joblib.dump, model, model_path),
+        loop.run_in_executor(None, joblib.dump, scaler, scaler_path),
+    )
+
+    logger.info(f"Model saved to {model_path}")
+    logger.info(f"Scaler saved to {scaler_path}")
+
+    print(f"Model training complete. MSE: {mse:.4f}, R2: {r2:.4f}")
+
+    return model, scaler, mse, r2
+
+
+def train_model(X, y, n_splits=5):
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+
+    mse_scores = []
+    r2_scores = []
+
+    for train_index, test_index in tscv.split(X):
+        X_train, X_test = X[train_index], X[test_index]
+        y_train, y_test = y[train_index], y[test_index]
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        mse_scores.append(mean_squared_error(y_test, y_pred))
+        r2_scores.append(r2_score(y_test, y_pred))
+
+    logger.info(
+        f"Mean MSE: {np.mean(mse_scores):.4f} (+/- {np.std(mse_scores) * 2:.4f})"
+    )
+    logger.info(f"Mean R2: {np.mean(r2_scores):.4f} (+/- {np.std(r2_scores) * 2:.4f})")
+
+    # Train final model on all data
+    model.fit(X, y)
+    return model
+
+
+async def load_model_and_predict(
+    df: pd.DataFrame,
+    model_path: str = "rf_model.joblib",
+    scaler_path: str = "scaler.joblib",
+) -> pd.DataFrame:
+    if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+        raise FileNotFoundError(
+            "Model or scaler file not found. Please train the model first."
+        )
+
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor() as pool:
+        model, scaler = await asyncio.gather(
+            loop.run_in_executor(pool, joblib.load, model_path),
+            loop.run_in_executor(pool, joblib.load, scaler_path),
+        )
+
+    logger.info("Model and scaler loaded successfully")
+
+    try:
+        X_scaled = await loop.run_in_executor(None, prepare_data_for_prediction, df)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error preparing data for prediction: {e}")
+        return df
+
+    raw_predictions = await loop.run_in_executor(None, model.predict, X_scaled)
+
+    df["ML_Prediction"] = np.round(raw_predictions, CONFIG["precision"])
+
+    logger.info(f"Predictions completed and added to dataframe")
+
+    return df
+
+
+async def get_historical_data(
+    client,
+    symbol: str = CONFIG["symbol"],
+    interval: str = CONFIG["interval"],
+    limit: int = CONFIG["limit"],
+) -> Optional[pd.DataFrame]:
+    raw_data = await fetch_and_process_data(client, symbol, interval, limit)
+    if raw_data is None:
+        return None
+
+    df = await calculate_indicators(raw_data)
+    df = await calculate_signals(df)
+    df = await apply_total_signal(df)
+    df = await load_model_and_predict(df)  # Use the pre-trained model for predictions
+    df = await calculate_trade_parameters(df)
+
+    await log_signals(df, symbol)
+
+    return await clean_dataframe(df)
+
+
+async def fetch_and_process_data(
+    client, symbol: str, interval: str, limit: int
+) -> Optional[pd.DataFrame]:
+    try:
+        raw_data = client.klines(symbol, interval, limit=limit)
+        if not raw_data:
+            logger.warning(f"No raw data fetched for {symbol}")
+            return None
+
+        df = pd.DataFrame(
+            raw_data,
+            columns=[
+                "open_time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "qav",
+                "num_trades",
+                "taker_base_vol",
+                "taker_quote_vol",
+                "ignore",
+            ],
+        )
+        df.index = pd.to_datetime(df["open_time"], unit="ms")
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df.dropna(inplace=True)
+
+        if df.empty:
+            logger.warning(f"Processed DataFrame is empty for {symbol}")
+            return None
+
+        return df
+    except Exception as e:
+        logger.error(f"Error processing data for {symbol}: {e}")
+        return None
+
+
+async def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    atr_indicator = AverageTrueRange(
+        high=df["high"], low=df["low"], close=df["close"], window=14
+    )
+    df["atr"] = atr_indicator.average_true_range()
+
+    rsi_indicator = RSIIndicator(close=df["close"], window=14)
+    df["rsi"] = rsi_indicator.rsi()
+
+    sma_indicator = SMAIndicator(close=df["close"], window=20)
+    df["SMA"] = sma_indicator.sma_indicator().round(precision)
+
+    macd_indicator = MACD(
+        close=df["close"], window_fast=12, window_slow=26, window_sign=9
+    )
+    df["MACD"] = macd_indicator.macd().round(precision)
+    df["MACD_Signal"] = macd_indicator.macd_signal().round(precision)
+
+    df["SMA_50"] = SMAIndicator(close=df["close"], window=50).sma_indicator()
+    df["SMA_200"] = SMAIndicator(close=df["close"], window=200).sma_indicator()
+
+    bb_indicator = BollingerBands(close=df["close"], window=14, window_dev=2)
+    df["bbm"] = bb_indicator.bollinger_mavg().round(precision)
+    df["bbh"] = bb_indicator.bollinger_hband().round(precision)
+    df["bbl"] = bb_indicator.bollinger_lband().round(precision)
+    df["bb_width"] = bb_indicator.bollinger_wband()
+
+    return df
+
+
+async def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df["MACD_Crossover"] = df["MACD"] > df["MACD_Signal"]
+    df["UPTREND"] = df["SMA_50"] > df["SMA_200"]
+
+    current_price = df["close"].iloc[-1]
+    last_sma = df["SMA"].iloc[-1]
+
+    df["current_l"] = current_price < last_sma
+    df["current_h"] = current_price > last_sma
+
+    return df
+
+
+async def calculate_trade_parameters(df: pd.DataFrame) -> pd.DataFrame:
+    current_price = Decimal(str(df["close"].iloc[-1]))
+    atr = Decimal(str(df["atr"].iloc[-1]))
+    last_rsi = Decimal(str(df["rsi"].iloc[-1]))
+    current_change = Decimal(str(df["close"].pct_change().iloc[-1]))
+    ml_prediction = Decimal(str(df["ML_Prediction"].iloc[-1]))
+
+    # Compute risk amount and prices
+    risk_amount = round_decimal(
+        Decimal(str(CONFIG["account_balance"]))
+        * Decimal(str(CONFIG["risk_percentage"])),
+        CONFIG["precision"],
+    )
+    buy_price = round_decimal(
+        current_price * (Decimal("1") - Decimal(str(CONFIG["deviation_percentage"]))),
+        CONFIG["precision"],
+    )
+    sell_price = round_decimal(
+        current_price * (Decimal("1") + Decimal(str(CONFIG["deviation_percentage"]))),
+        CONFIG["precision"],
+    )
+
+    profit = Decimal(str(CONFIG["profit_target"]))
+    stop_loss_value = round_decimal(
+        current_price - Decimal(str(CONFIG["trailing_stop_loss_offset"])),
+        CONFIG["precision"],
+    )
+    quantity = max(int(risk_amount / buy_price), CONFIG["minimum_lot_size"])
+
+    buy_signals = bool(df["BuySignal"].iloc[-1] == 1)
+    sell_signals = bool(df["SellSignal"].iloc[-1] == 1)
+
+    buy_price = (
+        ml_prediction if (buy_signals & (ml_prediction < current_price)) else buy_price
+    )
+    sell_price = (
+        ml_prediction
+        if (sell_signals & (ml_prediction > current_price))
+        else sell_price
+    )
+    # Update DataFrame with calculated values
+    df["Buy_Price"] = buy_price
+    df["Sell_Price"] = sell_price
+    df["Stop_Loss"] = stop_loss_value
+    df["Risk_Amount"] = risk_amount
+    df["Profit_Target"] = profit
+    df["Quantity"] = quantity
+    df["Price_Change"] = current_change
+
+    # Prepare data and make predictions
+    X_scaled = prepare_data_for_prediction(df)
+    ml_predictions = await load_model_and_predict(X_scaled)
+    df["ML_Prediction"] = ml_predictions
+
+    # Use ML predictions to adjust buy and sell prices
+    df["Buy_Price"] = np.where(
+        (df["ML_Prediction"] < df["close"]),
+        df["ML_Prediction"],
+        df["Buy_Price"],
+    )
+    df["Sell_Price"] = np.where(
+        (df["ML_Prediction"] > df["close"]),
+        df["ML_Prediction"],
+        df["Sell_Price"],
+    )
+
+    # Calculate trading signals
+    df["long_entry"] = (
+        df["current_l"]
+        & df["MACD_Crossover"]
+        & df["UPTREND"]
+        & (df["ML_Prediction"] > df["close"])
+        & (buy_signals)
+    )
+    df["short_entry"] = (
+        df["current_h"]
+        & ~df["MACD_Crossover"]
+        & ~df["UPTREND"]
+        & (df["ML_Prediction"] < df["close"])
+        & (sell_signals)
+    )
+
+    # Adjust trading signals based on ML predictions
+    df["long_entry"] = df["long_entry"] & (df["ML_Prediction"] > df["close"])
+    df["short_entry"] = df["short_entry"] & (df["ML_Prediction"] < df["close"])
+
+    # long_entry = buy_signals and current_l and (macd_crossover or uptrend)
+    # short_entry = sell_signals and current_h and (not macd_crossover or not uptrend)
+    # exit_long = (current_change > profit or current_price < (1 - stop_loss_value)) #and last_rsi > 50
+    # exit_short = (current_change < -profit or current_price > (1 + stop_loss_value))
+    # Calculate exit signals
+    df["exit_long"] = (
+        (df["close"].pct_change() > float(profit))
+        | (df["close"] < float(stop_loss_value))
+        | (df["ML_Prediction"] < df["close"])
+    )
+    df["exit_short"] = (
+        (df["close"].pct_change() < -float(profit))
+        | (df["close"] > (df["close"] + float(stop_loss_value)))
+        | (df["ML_Prediction"] > df["close"])
+    )
+
+    # Finalize buy and sell signals
+    df["Buy"] = df["long_entry"] | df["exit_short"]
+    df["Sell"] = df["short_entry"] | df["exit_long"]
+    return df
+
+
+async def log_signals(df: pd.DataFrame, symbol: str) -> None:
+    if df["Buy"].iloc[-1] or df["Sell"].iloc[-1]:
+        logger.info(
+            "Sell and Buy signals for %s:\n%s",
+            symbol,
+            df[["close", "rsi", "bbm", "bbh", "bbl", "atr", "SMA", "ML_Prediction"]]
+            .tail(1)
+            .to_string(),
+        )
+    else:
+        logger.info(
+            "No buy or sell signals for %s:\n%s",
+            symbol,
+            df[["close", "rsi", "bbm", "bbh", "bbl", "atr", "SMA", "ML_Prediction"]]
+            .tail(1)
+            .to_string(),
+        )
+
+
+async def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    columns_to_drop = [
+        "SMA_50",
+        "SMA_200",
+        "MACD",
+        "MACD_Signal",
+        "bbm",
+        "bbh",
+        "bbl",
+        "atr",
+        "SMA",
+        "volume",
+        "close_time",
+        "qav",
+        "num_trades",
+        "taker_base_vol",
+        "taker_quote_vol",
+        "ignore",
+    ]
+    df = df.drop(columns_to_drop, axis=1, errors="ignore")
+    return df
+
+
+async def prepare_data_for_prediction(df: pd.DataFrame) -> np.ndarray:
+    features = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "atr",
+        "rsi",
+        "SMA",
+        "MACD",
+        "MACD_Signal",
+        "SMA_50",
+        "SMA_200",
+        "bbm",
+        "bbh",
+        "bbl",
+        "bb_width",
+    ]
+    return df[features].values

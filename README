@@ -1,0 +1,35 @@
+This PositionTracker class, along with the RateLimiter class, is designed to manage trading positions and enforce rate limits on API calls. Here’s an overview of the functionality provided:
+RateLimiter
+
+This class ensures that API calls are made within specified limits to avoid hitting rate limits:
+
+    wait(): Ensures that the number of API calls does not exceed the specified limit within a given period.
+
+PositionTracker
+
+This class manages trading positions and monitors orders:
+
+    Initialization and Context Management: Initializes with a client, orders, and a rate limiter. It can be used as an asynchronous context manager.
+    Rate Limiting: Uses the RateLimiter to control API call rates.
+    Position Management:
+        get_open_positions(): Returns open positions for a given symbol.
+        monitor_order_status(): Continuously checks the status of an order until it is filled or canceled.
+        create_stop_loss_order(): Places a stop-loss order for a given symbol.
+        update_position(): Updates the tracked positions when an order is filled.
+        remove_position(): Removes a position when an order is canceled.
+        close_position(): Closes a position at the market price.
+        get_filled_orders(): Returns a list of filled orders for a given symbol.
+        new_position(): Adds and starts monitoring a new position.
+        start_monitoring(): Starts a task to monitor an order’s status.
+        round_price(): Rounds prices to a specified number of decimal places.
+        cancel_open_orders(): Cancels all open orders for a given symbol.
+        get_position_value(): Calculates the total value of all positions for a given symbol.
+        close_all_positions(): Closes all open positions for a given symbol.
+        emergency_closure(): Performs an emergency closure of all positions and cancels open orders for a given symbol.
+
+Integration with execute_trading_strategy
+
+Your execute_trading_strategy function leverages the PositionTracker to handle entries, exits, and monitoring of positions, ensuring that the strategy is executed within the rate limits and with proper handling of exceptions and order statuses.
+Example Usage
+
+Here’s how you might use these classes in an example scenario:
